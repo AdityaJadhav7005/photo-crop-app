@@ -1,0 +1,583 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Rotate-preview → Straight final crop + Sharpen</title>
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<style>
+  :root{--accent:#0b76ff;--danger:#d33;}
+  body{font-family:Arial,Helvetica,sans-serif;padding:14px;color:#222;}
+  .controls{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:8px}
+  button,input,select{padding:6px 8px;font-size:14px}
+  #stage{position:relative;border:1px solid #ddd;display:inline-block;background:#fafafa; vertical-align:top}
+  canvas#viewer{display:block; max-width:900px; background:#fff}
+  /* overlay crop box */
+  #cropBox{position:absolute; border:2px dashed var(--danger); box-sizing:border-box; transform-origin:center center; display:none; background:rgba(255,255,255,0.02)}
+  .handle{width:10px;height:10px;background:var(--danger);position:absolute;border-radius:2px; z-index:2}
+  .h-tl{left:-6px;top:-6px;cursor:nwse-resize}
+  .h-tr{right:-6px;top:-6px;cursor:nesw-resize}
+  .h-bl{left:-6px;bottom:-6px;cursor:nesw-resize}
+  .h-br{right:-6px;bottom:-6px;cursor:nwse-resize}
+  #previewGrid{display:grid;grid-template-columns:repeat(5,1fr);gap:8px;margin-left:18px;max-width:680px}
+  .slot{min-height:110px;border:1px dashed #bbb;background:#fff;padding:6px;display:flex;flex-direction:column;align-items:center;justify-content:center;position:relative}
+  .slot .pos{position:absolute;left:6px;top:6px;color:#666;font-size:12px}
+  .slot img{max-width:100%;max-height:90px;border:1px solid #444}
+  #container{display:flex;gap:12px;align-items:flex-start}
+  .hint{font-size:13px;color:#333;margin-bottom:6px}
+  .button-like{display:inline-block;padding:6px 8px;margin-right:6px;text-decoration:none;border:1px solid #888;border-radius:4px;background:#f5f5f5;color:#111}
+  /* make everything responsive */
+  @media (max-width:980px){
+    #container{flex-direction:column}
+    #previewGrid{max-width:100%; margin-left:0}
+  }
+</style>
+</head>
+<body>
+
+<h2>Rotate-preview → Straight final crop + Sharpen</h2>
+
+<div class="controls">
+  <input id="fileInput" type="file" accept="image/*" />
+  <button id="nextBtn">Next Image ▶</button>
+  <button id="resetBtn">Reset Angle</button>
+  <button id="cropBtn">Crop (C)</button>
+  <button id="undoBtn">Undo (Ctrl+Z)</button>
+  <button id="zipBtn">Save All ZIP</button>
+  <button id="buyTokenBtn">Buy Tokens</button>
+  <span id="tokenDisplay" style="font-weight:bold;color:green;margin-left:10px;">Tokens: 0</span>
+
+  <div style="margin-left:6px;">
+    W(px): <input id="finalW" type="number" value="413" style="width:80px"> 
+    H(px): <input id="finalH" type="number" value="531" style="width:80px">
+    <button id="applySize">Apply</button>
+  </div>
+
+  <div style="margin-left:6px;">
+    Sharpen: 
+    <select id="sharpenSelect">
+      <option value="0">0%</option>
+      <option value="100">100%</option>
+      <option value="200">200%</option>
+      <option value="300">300%</option>
+      <option value="400">400%</option>
+      <option value="500" selected>500%</option>
+    </select>
+  </div>
+
+  <div style="margin-left:6px;">
+   Crop Shape:
+    <select id="cropShape" style="padding:6px;border-radius:6px;">
+      <option value="rect" selected>Rectangle (JPG)</option>
+      <option value="roundRect">Rounded Rectangle (PNG)</option>
+    </select>
+  </div>
+</div>
+
+<div class="hint">
+  Rotate preview: Hold <strong>Ctrl</strong> and click+drag anywhere on the image to rotate the crop box visually.<br>
+  Move: drag the crop box. Resize with corner handles. Shortcuts: <strong>C</strong> = Crop, <strong>Ctrl+Z</strong> = Undo.
+</div>
+
+<div id="container">
+  <div id="stage">
+    <canvas id="viewer"></canvas>
+    <div id="cropBox">
+      <div class="handle h-tl"></div>
+      <div class="handle h-tr"></div>
+      <div class="handle h-bl"></div>
+      <div class="handle h-br"></div>
+    </div>
+  </div>
+
+  <div style="flex:1">
+    <h3>5×5 Grid (positions 1 → 25)</h3>
+    <div id="previewGrid" aria-label="preview grid"></div>
+  </div>
+</div>
+
+<!-- libs -->
+<script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/file-saver@2.0.5/dist/FileSaver.min.js"></script>
+<script src="https://checkout.razorpay.com/v1/checkout.js"></script>
+
+<script>
+/* =============================
+   FINAL single-script version
+   1 photo = 1 token (A)
+   Replace RAZORPAY_KEY with your test key if needed
+   Backend: http://localhost:5000/create-order and /verify-payment
+   ============================= */
+
+// ---- CONFIG ----
+const RAZORPAY_KEY = 'rzp_test_trialkey'; // <-- replace with your test key if needed
+const BACKEND_BASE = 'http://localhost:5000'; // change if your server runs elsewhere
+
+// ---- TOKENS (localStorage) ----
+window.tokens = parseInt(localStorage.getItem("tokens") || "0", 10) || 0;
+function updateTokenUI(){
+  document.getElementById("tokenDisplay").innerText = "Tokens: " + window.tokens;
+  localStorage.setItem("tokens", String(window.tokens));
+}
+updateTokenUI();
+
+// ---- ELEMENTS ----
+const viewer = document.getElementById('viewer');
+const ctx = viewer.getContext('2d');
+const fileInput = document.getElementById('fileInput');
+const cropBox = document.getElementById('cropBox');
+const previewGrid = document.getElementById('previewGrid');
+const nextBtn = document.getElementById('nextBtn');
+const resetBtn = document.getElementById('resetBtn');
+const cropBtn = document.getElementById('cropBtn');
+const undoBtn = document.getElementById('undoBtn');
+const zipBtn = document.getElementById('zipBtn');
+const buyTokenBtn = document.getElementById('buyTokenBtn');
+const finalWInput = document.getElementById('finalW');
+const finalHInput = document.getElementById('finalH');
+const applySize = document.getElementById('applySize');
+const sharpenSelect = document.getElementById('sharpenSelect');
+const shapeSelect = document.getElementById('cropShape');
+
+// ---- STATE ----
+let files = [], currentIndex = 0;
+let img = new Image();
+let naturalW=0, naturalH=0;
+let displayScale = 1;
+
+let box = { left: 60, top: 60, width: 150, height: 200, angle: 0 };
+let dragging = false, dragOffset = {x:0,y:0};
+let resizing = false, resizeHandle = null, resizeStart = {};
+let rotateActive = false, rotateCenter = {x:0,y:0}, rotateStartAngle = 0;
+let history = [];
+
+// ---- INIT GRID ----
+function initGrid(){
+  previewGrid.innerHTML = '';
+  for(let i=1;i<=25;i++){
+    const s=document.createElement('div'); s.className='slot'; s.dataset.pos=i;
+    s.innerHTML=`<div class="pos">${i}</div><div class="empty">Empty</div>`;
+    previewGrid.appendChild(s);
+  }
+}
+initGrid();
+
+// ---- LOAD IMAGES ----
+fileInput.addEventListener('change',(e)=>{
+  files = Array.from(e.target.files || []);
+  currentIndex = 0;
+  if(files.length) loadCurrent();
+});
+
+function loadCurrent(){
+  if(!files.length) return;
+  const url = URL.createObjectURL(files[currentIndex]);
+  img = new Image();
+  img.onload = ()=>{
+    naturalW = img.naturalWidth; naturalH = img.naturalHeight;
+    const maxW = 900;
+    displayScale = Math.min(1, maxW / img.naturalWidth);
+    viewer.width = Math.round(img.naturalWidth * displayScale);
+    viewer.height = Math.round(img.naturalHeight * displayScale);
+    // reset box proportional
+    box.width = Math.round(viewer.width * 0.18);
+    box.height = Math.round(box.width * (35/45));
+    box.left = Math.round((viewer.width - box.width)/2);
+    box.top = Math.round((viewer.height - box.height)/2);
+    box.angle = 0;
+    cropBox.style.display = 'block';
+    updateCropBoxStyle();
+    drawViewer();
+  };
+  img.src = url;
+}
+
+function drawViewer(){
+  ctx.clearRect(0,0,viewer.width,viewer.height);
+  // draw a light checker or plain background if needed
+  ctx.drawImage(img, 0, 0, viewer.width, viewer.height);
+}
+
+// Update crop box CSS (position relative to stage)
+function updateCropBoxStyle(){
+  cropBox.style.left = box.left + 'px';
+  cropBox.style.top  = box.top + 'px';
+  cropBox.style.width = box.width + 'px';
+  cropBox.style.height = box.height + 'px';
+  cropBox.style.transform = `rotate(${box.angle}deg)`;
+  cropBox.style.transformOrigin = 'center center';
+}
+
+// ---- MOUSE HANDLERS (drag/resize/rotate) ----
+// Use bounding rect of viewer to calculate local coords correctly even when page scrolled.
+cropBox.addEventListener('mousedown', (e)=>{
+  e.preventDefault();
+  if(e.target.classList.contains('handle')) {
+    resizing = true;
+    const classes = e.target.classList;
+    resizeHandle = classes.contains('h-tl')?'tl':classes.contains('h-tr')?'tr':classes.contains('h-bl')?'bl':'br';
+    resizeStart = { mx:e.clientX, my:e.clientY, left:box.left, top:box.top, w:box.width, h:box.height };
+    return;
+  }
+  // normal drag
+  if(e.ctrlKey || e.metaKey) return;
+  dragging = true;
+  const r = cropBox.getBoundingClientRect();
+  dragOffset.x = e.clientX - r.left;
+  dragOffset.y = e.clientY - r.top;
+  document.body.style.userSelect = 'none';
+});
+
+document.addEventListener('mousemove', (e)=>{
+  const vrect = viewer.getBoundingClientRect();
+  if(resizing && resizeHandle){
+    // compute mouse relative to viewer
+    const mx = Math.max(0, Math.min(e.clientX - vrect.left, viewer.width));
+    const my = Math.max(0, Math.min(e.clientY - vrect.top, viewer.height));
+    let left = resizeStart.left, top = resizeStart.top, w = resizeStart.w, h = resizeStart.h;
+    if(resizeHandle==='br'){
+      let newW=Math.max(20,w+(e.clientX-resizeStart.mx));
+      let newH=Math.round(newW*(h/w));
+      if(top+newH>viewer.height){ newH=viewer.height-top; newW=Math.round(newH*(w/h)); }
+      box.width=newW; box.height=newH;
+    } else if(resizeHandle==='bl'){
+      let newLeft=Math.max(0,Math.min(mx,left+w-20));
+      let newW=Math.round(left+w-newLeft);
+      let newH=Math.round(newW*(h/w));
+      if(top+newH>viewer.height){ newH=viewer.height-top; newW=Math.round(newH*(w/h)); newLeft=left+w-newW; }
+      box.left=newLeft; box.width=newW; box.height=newH;
+    } else if(resizeHandle==='tr'){
+      let newTop=Math.max(0,Math.min(my,top+h-20));
+      let newH=Math.round(top+h-newTop);
+      let newW=Math.round(newH*(w/h));
+      if(left+newW>viewer.width){ newW=viewer.width-left; newH=Math.round(newW*(h/w)); newTop=top+h-newH; }
+      box.top=newTop; box.width=newW; box.height=newH;
+    } else if(resizeHandle==='tl'){
+      let newLeft=Math.max(0,Math.min(mx,left+w-20));
+      let newTop=Math.max(0,Math.min(my,top+h-20));
+      let newW=Math.round(left+w-newLeft);
+      let newH=Math.round(top+h-newTop);
+      const ratio=w/h;
+      newH=Math.round(newW/ratio);
+      if(top+h-newH<0){ newH=Math.min(newH,top+h); newW=Math.round(newH*ratio); }
+      box.left=(left+w-newW); box.top=(top+h-newH); box.width=newW; box.height=newH;
+    }
+    updateCropBoxStyle(); return;
+  }
+
+  if(dragging){
+    // compute local coords relative to viewer
+    const localX = e.clientX - vrect.left;
+    const localY = e.clientY - vrect.top;
+    const newLeft = Math.max(0, Math.min(localX - dragOffset.x, viewer.width - box.width));
+    const newTop  = Math.max(0, Math.min(localY - dragOffset.y, viewer.height - box.height));
+    box.left = Math.round(newLeft);
+    box.top  = Math.round(newTop);
+    updateCropBoxStyle();
+    return;
+  }
+
+  if(rotateActive){
+    const ang = Math.atan2(e.clientY - rotateCenter.y, e.clientX - rotateCenter.x) * 180 / Math.PI;
+    box.angle = ang - rotateStartAngle;
+    if(box.angle>180) box.angle -= 360;
+    if(box.angle<-180) box.angle += 360;
+    updateCropBoxStyle();
+  }
+});
+
+document.addEventListener('mouseup', ()=>{
+  dragging=false; resizing=false; resizeHandle=null; rotateActive=false; document.body.style.userSelect='';
+});
+
+// rotate by Ctrl + drag on stage (not on handles)
+const stage = document.getElementById('stage');
+stage.addEventListener('mousedown',(e)=>{
+  if(!(e.ctrlKey||e.metaKey)) return;
+  if(e.target.classList.contains('handle')) return;
+  const crect = cropBox.getBoundingClientRect();
+  rotateCenter.x = crect.left + crect.width/2;
+  rotateCenter.y = crect.top + crect.height/2;
+  const startAng = Math.atan2(e.clientY - rotateCenter.y, e.clientX - rotateCenter.x) * 180/Math.PI;
+  rotateStartAngle = startAng - box.angle;
+  rotateActive = true;
+  document.body.style.userSelect = 'none';
+});
+
+// keyboard shortcuts
+document.addEventListener('keydown',(e)=>{
+  if(e.key==='c' || e.key==='C'){ e.preventDefault(); doCrop(); }
+  if((e.ctrlKey||e.metaKey) && e.key.toLowerCase()==='z'){ e.preventDefault(); doUndo(); }
+  if(['ArrowUp','ArrowDown','ArrowLeft','ArrowRight'].includes(e.key) && !['INPUT','TEXTAREA'].includes(document.activeElement.tagName)){
+    e.preventDefault();
+    const step = e.shiftKey?20:5;
+    if(e.key==='ArrowLeft') box.left = Math.max(0, box.left - step);
+    if(e.key==='ArrowRight') box.left = Math.min(viewer.width - box.width, box.left + step);
+    if(e.key==='ArrowUp') box.top = Math.max(0, box.top - step);
+    if(e.key==='ArrowDown') box.top = Math.min(viewer.height - box.height, box.top + step);
+    updateCropBoxStyle();
+  }
+});
+
+// ---- APPLY SIZE ----
+applySize.addEventListener('click', ()=>{
+  const finalW = parseInt(finalWInput.value||413,10);
+  const finalH = parseInt(finalHInput.value||531,10);
+  // convert final pixels (natural) to display scale
+  const dispW = Math.round(finalW * (viewer.width / naturalW || displayScale));
+  const dispH = Math.round(finalH * (viewer.height / naturalH || displayScale));
+  box.width = Math.min(dispW, viewer.width - 10);
+  box.height = Math.min(dispH, viewer.height - 10);
+  box.left = Math.max(0, Math.min(box.left, viewer.width - box.width));
+  box.top = Math.max(0, Math.min(box.top, viewer.height - box.height));
+  updateCropBoxStyle();
+});
+
+// ---- CROP + SHARPEN + SHAPE ----
+function doCrop(){
+  if(!img.src){ alert('No image loaded'); return; }
+
+  // TOKEN CHECK: 1 token per crop
+  if(window.tokens <= 0){
+    alert("You don't have tokens. Please buy tokens first!");
+    return;
+  }
+
+  const styleLeft = box.left, styleTop = box.top, styleW = box.width, styleH = box.height;
+  const scaleX = naturalW / viewer.width;
+  const scaleY = naturalH / viewer.height;
+  const cx = Math.round((styleLeft + styleW/2) * scaleX);
+  const cy = Math.round((styleTop + styleH/2) * scaleY);
+  const sw = Math.round(styleW * scaleX);
+  const sh = Math.round(styleH * scaleY);
+
+  // draw rotated full image onto temp canvas to sample correctly
+  const diag = Math.ceil(Math.hypot(naturalW, naturalH));
+  const tempCanvas = document.createElement('canvas');
+  tempCanvas.width = tempCanvas.height = diag;
+  const tctx = tempCanvas.getContext('2d');
+
+  const rad = box.angle * Math.PI/180;
+  tctx.save();
+  tctx.translate(diag/2, diag/2);
+  tctx.rotate(-rad);
+  tctx.drawImage(img, -naturalW/2, -naturalH/2, naturalW, naturalH);
+  tctx.restore();
+
+  const dx = cx - naturalW/2;
+  const dy = cy - naturalH/2;
+  const cos = Math.cos(-rad), sin = Math.sin(-rad);
+  const rx = Math.round(dx * cos - dy * sin);
+  const ry = Math.round(dx * sin + dy * cos);
+  const tempCenterX = Math.round(diag/2 + rx);
+  const tempCenterY = Math.round(diag/2 + ry);
+
+  let sx = Math.round(tempCenterX - sw/2), sy = Math.round(tempCenterY - sh/2);
+  sx = Math.max(0, Math.min(sx, tempCanvas.width - sw));
+  sy = Math.max(0, Math.min(sy, tempCanvas.height - sh));
+
+  const finalW = Math.max(1, parseInt(finalWInput.value||413,10));
+  const finalH = Math.max(1, parseInt(finalHInput.value||531,10));
+  const out = document.createElement('canvas');
+  out.width = finalW; out.height = finalH;
+  const octx = out.getContext('2d');
+
+  // Apply simple visual filter if sharpen selected (this is CSS filter not real convolution)
+  const sharpenVal = parseInt(sharpenSelect.value||500,10);
+  if(sharpenVal > 0) octx.filter = `contrast(110%) brightness(105%) saturate(110%)`;
+  else octx.filter = 'none';
+
+  octx.drawImage(tempCanvas, sx, sy, sw, sh, 0, 0, finalW, finalH);
+  octx.filter = 'none';
+
+  // shape output
+  const shape = shapeSelect.value;
+  let dataURL, fileExt;
+  if(shape === 'roundRect'){
+    const maskCanvas = document.createElement('canvas');
+    maskCanvas.width = finalW; maskCanvas.height = finalH;
+    const mctx = maskCanvas.getContext('2d');
+    const radius = Math.round(Math.min(finalW, finalH) * 0.12);
+    mctx.beginPath();
+    mctx.moveTo(radius, 0);
+    mctx.lineTo(finalW - radius, 0);
+    mctx.quadraticCurveTo(finalW, 0, finalW, radius);
+    mctx.lineTo(finalW, finalH - radius);
+    mctx.quadraticCurveTo(finalW, finalH, finalW - radius, finalH);
+    mctx.lineTo(radius, finalH);
+    mctx.quadraticCurveTo(0, finalH, 0, finalH - radius);
+    mctx.lineTo(0, radius);
+    mctx.quadraticCurveTo(0, 0, radius, 0);
+    mctx.closePath();
+    mctx.clip();
+    mctx.drawImage(out, 0, 0);
+    dataURL = maskCanvas.toDataURL('image/png');
+    fileExt = 'png';
+  } else {
+    dataURL = out.toDataURL('image/jpeg', 0.92);
+    fileExt = 'jpg';
+  }
+
+  // Ask filename
+  let baseName = prompt('Enter name for this photo (no extension):');
+  if(!baseName || !baseName.trim()) baseName = `photo_${Date.now()}`;
+  baseName = baseName.trim();
+  const fileNameWithExt = `${baseName}.${fileExt}`;
+
+  // find slot
+  const slotPos = getFirstEmptySlot();
+  if(slotPos === null){
+    alert('All slots full (25). Remove some first.');
+    return;
+  }
+
+  // Deduct token (1 per crop) AFTER success — but we already checked; deduct now
+  window.tokens = Math.max(0, window.tokens - 1);
+  updateTokenUI();
+
+  placeInSlot(slotPos, fileNameWithExt, dataURL, fileExt);
+  history.push({ slot: slotPos, name: fileNameWithExt, dataURL: dataURL, ext: fileExt });
+}
+
+// ---- SLOTS / PLACE / UNDO ----
+function getFirstEmptySlot(){
+  const slots = Array.from(previewGrid.children);
+  for(const s of slots){
+    if(!s.dataset.filled) return parseInt(s.dataset.pos,10);
+  }
+  return null;
+}
+
+function placeInSlot(pos, filenameWithExt, dataURL, ext){
+  const slot = previewGrid.querySelector(`.slot[data-pos="${pos}"]`);
+  if(!slot) return;
+  slot.dataset.filled = '1';
+  slot.dataset.filename = filenameWithExt;
+  slot.dataset.fileext = ext;
+
+  const displayName = escapeHtml(filenameWithExt);
+
+  slot.innerHTML = `
+    <div class="pos">${pos}</div>
+    <h5>${displayName}</h5>
+    <img src="${dataURL}" alt="${displayName}" />
+    <div style="margin-top:6px">
+      <a class="button-like" download="${filenameWithExt}" href="${dataURL}">Download</a>
+      <button class="removeBtn">Remove</button>
+    </div>
+  `;
+
+  const removeBtn = slot.querySelector('.removeBtn');
+  removeBtn.addEventListener('click', ()=>{
+    delete slot.dataset.filled;
+    delete slot.dataset.filename;
+    delete slot.dataset.fileext;
+    slot.innerHTML = `<div class="pos">${pos}</div><div class="empty">Empty</div>`;
+    for(let i=history.length-1;i>=0;i--){
+      if(history[i].slot === pos){
+        history.splice(i,1);
+        break;
+      }
+    }
+  });
+}
+
+function doUndo(){
+  if(!history.length) return alert('Nothing to undo');
+  const last = history.pop();
+  const slot = previewGrid.querySelector(`.slot[data-pos="${last.slot}"]`);
+  if(slot){
+    delete slot.dataset.filled;
+    delete slot.dataset.filename;
+    delete slot.dataset.fileext;
+    slot.innerHTML = `<div class="pos">${last.slot}</div><div class="empty">Empty</div>`;
+  }
+}
+
+// ---- ZIP ALL ----
+zipBtn.addEventListener('click', async ()=>{
+  const zip = new JSZip();
+  let count = 0;
+  for(const s of previewGrid.children){
+    if(s.dataset.filled){
+      const imgEl = s.querySelector('img');
+      const fname = s.dataset.filename || (`photo_${s.dataset.pos}.jpg`);
+      const data = imgEl.src.split(',')[1];
+      zip.file(fname, data, {base64: true});
+      count++;
+    }
+  }
+  if(!count){ alert('No cropped images to save'); return; }
+  const blob = await zip.generateAsync({type:'blob'});
+  saveAs(blob, `cropped_photos_${Date.now()}.zip`);
+});
+
+// ---- UTIL ----
+function escapeHtml(s){ return String(s).replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;'); }
+
+// ---- NAV BUTTONS ----
+nextBtn.addEventListener('click', ()=>{
+  if(!files.length) return alert('No images');
+  if(currentIndex < files.length - 1){
+    currentIndex++;
+    loadCurrent();
+  } else alert('No more images');
+});
+resetBtn.addEventListener('click', ()=>{ box.angle = 0; updateCropBoxStyle(); });
+cropBtn.addEventListener('click', doCrop);
+undoBtn.addEventListener('click', doUndo);
+
+// ---- BUY TOKENS (Razorpay flow) ----
+buyTokenBtn.addEventListener('click', async ()=>{
+  try {
+    // call backend to create order
+    const resp = await fetch(BACKEND_BASE + '/create-order', { method: 'POST' });
+    if(!resp.ok) throw new Error('Failed to create order on server');
+    const order = await resp.json();
+
+    const options = {
+      key: RAZORPAY_KEY,
+      amount: order.amount, // in paise
+      currency: "INR",
+      name: "Photo Crop Tokens",
+      order_id: order.id,
+      handler: async function (response) {
+        try {
+          const vr = await fetch(BACKEND_BASE + '/verify-payment', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(response)
+          });
+          const data = await vr.json();
+          if(data.success){
+            window.tokens += data.tokensAdded || 0;
+            updateTokenUI();
+            alert('Payment successful. Tokens added: ' + (data.tokensAdded||0));
+          } else {
+            alert('Payment verification failed on server');
+          }
+        } catch(err){
+          console.error(err);
+          alert('Error verifying payment');
+        }
+      },
+      modal: {
+        ondismiss: function(){
+          // optionally notify server to cancel order
+        }
+      }
+    };
+
+    const rzp = new Razorpay(options);
+    rzp.open();
+  } catch(err){
+    console.error(err);
+    alert('Could not start payment: ' + err.message);
+  }
+});
+
+// Keep canvas responsive on resize
+window.addEventListener('resize', ()=>{ if(img.src) drawViewer(); });
+
+</script>
+</body>
+</html>
